@@ -371,11 +371,12 @@
           <button type="button" class="bbtn" id="beautyScan" disabled>AI · Nhận diện da, tóc và mặt</button>
           <p class="hint" id="beautyStatus" role="status" aria-live="polite">Bấm nhận diện rồi chọn mức làm đẹp. Lần đầu cần mạng tải AI; ảnh được xử lý tại máy.</p>
           <div class="beauty-section" id="beautySkin"></div>
+          <div class="beauty-section" id="beautySmooth"></div>
           <div class="beauty-section" id="beautyHair"></div>
           <div class="beauty-section" id="beautyLip"></div>
           <div class="beauty-section" id="beautyBlush"></div>
           <div class="beauty-section" id="beautyBrow"></div>
-          <p class="hint">Da và tóc áp dụng trên các vùng AI tìm thấy trong ảnh. Makeup theo tối đa 3 khuôn mặt. Chọn màu rồi chỉnh độ đậm; bấm đúp vào thanh để về 0. Tóc sáng màu là mô phỏng, nên thử mức vừa phải để giữ chi tiết tóc.</p>
+          <p class="hint">Da và tóc áp dụng trên các vùng AI tìm thấy trong ảnh. Làm mịn mặt cần nhận diện cả da và khuôn mặt; thử mức 20–40 để giữ nét tự nhiên. Làm mịn và makeup theo tối đa 3 khuôn mặt. Chọn màu rồi chỉnh độ đậm; bấm đúp vào thanh để về 0. Tóc sáng màu là mô phỏng, nên thử mức vừa phải để giữ chi tiết tóc.</p>
           <div class="bodybtns"><button type="button" class="bbtn" id="beautyPeek">Giữ để xem trước làm đẹp</button><button type="button" class="bbtn" id="beautyReset">Xóa làm đẹp</button></div>
         </div>
       </div>
@@ -3268,10 +3269,10 @@ bodyAiUI();
 
 
 /* ============ làm đẹp: tách vùng da/tóc và mốc makeup, độc lập với P/preset ============ */
-const BEAUTY_DEFAULT = {skin:0,hair:0,lip:0,blush:0,brow:0,
+const BEAUTY_DEFAULT = {skin:0,smooth:0,hair:0,lip:0,blush:0,brow:0,
   hairColor:"#794437",lipColor:"#b7374d",blushColor:"#dc7b88",browColor:"#553c32"};
 const BEAUTY = {values:{...BEAUTY_DEFAULT},open:false,peek:false,busy:false,job:0,source:null,
-  maps:null,faces:[],worker:null,pending:null,main:null,mainRun:null,faceCache:null,ready:{skin:false,hair:false,face:false}};
+  maps:null,faces:[],worker:null,pending:null,main:null,mainRun:null,faceCache:null,ready:{skin:false,smooth:false,hair:false,face:false}};
 const BEAUTY_ASSETS = {
   roots:BODY_AI_ASSETS.roots,
   segment:"https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/1/selfie_multiclass_256x256.tflite",
@@ -3530,17 +3531,90 @@ function beautyFaceMasks(face,W,H){
     ctx.fillStyle=gradient;ctx.beginPath();ctx.arc(0,0,1,0,Math.PI*2);ctx.fill();ctx.restore();
   }
   ctx.globalCompositeOperation="destination-in";ctx.fillStyle="#fff";ctx.beginPath();path(BEAUTY_SHAPES.oval);ctx.fill();
-  const blush=alpha(0);canvas.width=canvas.height=0;
-  return {x,y,w,h,MW,MH,lip,brow,blush};
+  const blush=alpha(0);
+  // Mịn chỉ trong mặt: lùi khỏi viền mặt, chừa mắt, môi, chân mày và đầu mũi.
+  ctx.globalCompositeOperation="source-over";ctx.clearRect(0,0,MW,MH);
+  ctx.fillStyle="#fff";ctx.strokeStyle="#fff";ctx.beginPath();path(BEAUTY_SHAPES.oval);ctx.fill();
+  const oval=alpha(0),feather=Math.max(1,Math.round(MW*.012));
+  ctx.globalCompositeOperation="destination-out";ctx.lineWidth=Math.max(2,MW*.035);ctx.stroke();
+  const faceSkin=alpha(feather);
+  ctx.globalCompositeOperation="source-over";ctx.clearRect(0,0,MW,MH);ctx.lineWidth=Math.max(2,MW*.025);ctx.lineJoin="round";
+  for(const shape of ["eyeL","eyeR","lip","browL","browR"]){ctx.beginPath();path(BEAUTY_SHAPES[shape]);ctx.fill();ctx.stroke();}
+  const nose=face[1];
+  if(nose&&Number.isFinite(nose.x)&&Number.isFinite(nose.y)){
+    ctx.save();ctx.translate((nose.x*W-x)*sx,(nose.y*H-y)*sy);ctx.rotate(eyeAngle);
+    ctx.beginPath();ctx.ellipse(0,0,Math.max(1,faceW*.085*sx),Math.max(1,faceH*.055*sy),0,0,Math.PI*2);ctx.fill();ctx.restore();
+  }
+  const hard=alpha(0),soft=alpha(feather);
+  for(let k=0;k<faceSkin.length;k++)faceSkin[k]=Math.round(faceSkin[k]*oval[k]/255*(1-Math.max(hard[k],soft[k])/255));
+  canvas.width=canvas.height=0;
+  return {x,y,w,h,MW,MH,lip,brow,blush,smooth:faceSkin};
+}
+function beautyFacePatches(W,H){
+  const key=W+"x"+H;
+  if(!BEAUTY.faceCache||BEAUTY.faceCache.key!==key)
+    BEAUTY.faceCache={key,patches:BEAUTY.faces.map(f=>beautyFaceMasks(f,W,H)).filter(Boolean)};
+  return BEAUTY.faceCache.patches;
+}
+let beautySmoothRange;
+function beautySmoothTarget(c,patch){
+  const {x,y,w,h,MW,MH}=patch,canvas=document.createElement("canvas");canvas.width=MW;canvas.height=MH;
+  const ctx=canvas.getContext("2d");ctx.imageSmoothingEnabled=true;ctx.imageSmoothingQuality="high";
+  ctx.drawImage(c.canvas,x,y,w,h,0,0,MW,MH);
+  const d=ctx.getImageData(0,0,MW,MH).data,colors=[new Float32Array(MW*MH),new Float32Array(MW*MH),new Float32Array(MW*MH)];
+  // Bilateral: trung bình các màu gần nhau, giữ ranh giới sáng/tối thay vì blur toàn mặt.
+  if(!beautySmoothRange){
+    const sigma=18;beautySmoothRange=new Float32Array(18*sigma*sigma+1);
+    for(let i=0;i<beautySmoothRange.length;i++)beautySmoothRange[i]=Math.exp(-i/(2*sigma*sigma));
+  }
+  const spatial=[.135335,.606531,1,.606531,.135335],step=Math.max(1,Math.round(Math.min(MW,MH)*.0075));
+  const offsets=[];
+  for(let dy=-2;dy<=2;dy++)for(let dx=-2;dx<=2;dx++)offsets.push([dx*step,dy*step,spatial[dx+2]*spatial[dy+2]]);
+  for(let yy=0;yy<MH;yy++)for(let xx=0;xx<MW;xx++){
+    const p=yy*MW+xx,i=p*4,r=d[i],g=d[i+1],b=d[i+2];let rr=0,gg=0,bb=0,total=0;
+    if(d[i+3])for(const[dx,dy,weight]of offsets){
+      const q=(clamp(yy+dy,0,MH-1)*MW+clamp(xx+dx,0,MW-1))*4;
+      const dr=d[q]-r,dg=d[q+1]-g,db=d[q+2]-b,dist=dr*dr+dg*dg+db*db;
+      if(dist>=beautySmoothRange.length||!d[q+3])continue;
+      const a=weight*beautySmoothRange[dist]*d[q+3]/255;
+      rr+=d[q]*a;gg+=d[q+1]*a;bb+=d[q+2]*a;total+=a;
+    }
+    colors[0][p]=total?rr/total:r;colors[1][p]=total?gg/total:g;colors[2][p]=total?bb/total:b;
+  }
+  canvas.width=canvas.height=0;return colors;
+}
+function beautySmoothFace(c,W,H){
+  const v=BEAUTY.values,m=BEAUTY.maps;
+  if(v.smooth<=.001||!m||!BEAUTY.ready.smooth)return;
+  const skinSample=beautySampleMap(m.skin,m.width,m.height,W,H),skinRow=new Float32Array(m.width);
+  const patches=beautyFacePatches(W,H);
+  for(const patch of patches)if(!patch.smoothTarget)patch.smoothTarget=beautySmoothTarget(c,patch);
+  for(const patch of patches){
+    const {x:ox,y:oy,w,h,MW,MH}=patch,image=c.getImageData(ox,oy,w,h),d=image.data;
+    const sample=beautySampleMap(patch.smooth,MW,MH,w,h),faceRow=new Float32Array(MW);
+    const samples=patch.smoothTarget.map(map=>beautySampleMap(map,MW,MH,w,h)),rows=samples.map(()=>new Float32Array(MW));
+    for(let y=0;y<h;y++){
+      skinSample.row(oy+y,skinRow);sample.row(y,faceRow);samples.forEach((s,k)=>s.row(y,rows[k]));
+      for(let x=0;x<w;x++){
+        const i=(y*w+x)*4;if(!d[i+3])continue;
+        const x0=sample.X[x],fx=sample.F[x],sx=skinSample.X[ox+x],sf=skinSample.F[ox+x];
+        const mask=(faceRow[x0]+(faceRow[x0+1]-faceRow[x0])*fx)*(skinRow[sx]+(skinRow[sx+1]-skinRow[sx])*sf)/(255*255);
+        if(mask<.004)continue;
+        const dr=rows[0][x0]+(rows[0][x0+1]-rows[0][x0])*fx-d[i];
+        const dg=rows[1][x0]+(rows[1][x0+1]-rows[1][x0])*fx-d[i+1];
+        const db=rows[2][x0]+(rows[2][x0+1]-rows[2][x0])*fx-d[i+2];
+        const edge=1-smooth(26*26*3,52*52*3,dr*dr+dg*dg+db*db),a=mask*v.smooth*.88*edge;
+        d[i]+=dr*a;d[i+1]+=dg*a;d[i+2]+=db*a;
+      }
+    }
+    c.putImageData(image,ox,oy);
+  }
 }
 function beautyMakeup(c,W,H){
   const v=BEAUTY.values;
   if(!BEAUTY.ready.face||!(v.lip>.001||v.blush>.001||v.brow>.001))return;
-  const key=W+"x"+H;
-  if(!BEAUTY.faceCache||BEAUTY.faceCache.key!==key)
-    BEAUTY.faceCache={key,patches:BEAUTY.faces.map(f=>beautyFaceMasks(f,W,H)).filter(Boolean)};
   const colors={lip:beautyHex(v.lipColor),blush:beautyHex(v.blushColor),brow:beautyHex(v.browColor)};
-  for(const patch of BEAUTY.faceCache.patches){
+  for(const patch of beautyFacePatches(W,H)){
     const {x:ox,y:oy,w,h,MW,MH}=patch,image=c.getImageData(ox,oy,w,h),d=image.data;
     const kinds=["lip","blush","brow"].filter(k=>v[k]>.001);
     const samplers=kinds.map(k=>beautySampleMap(patch[k],MW,MH,w,h));
@@ -3578,14 +3652,14 @@ function beautyMakeup(c,W,H){
 function beautyApply(c,W,H){
   if(BEAUTY.peek||BEAUTY.source!==source)return;
   const v=BEAUTY.values;
-  if(!(v.skin>.001||v.hair>.001||v.lip>.001||v.blush>.001||v.brow>.001))return;
-  beautySkinHair(c,W,H);beautyMakeup(c,W,H);
+  if(!(v.skin>.001||v.smooth>.001||v.hair>.001||v.lip>.001||v.blush>.001||v.brow>.001))return;
+  beautySmoothFace(c,W,H);beautySkinHair(c,W,H);beautyMakeup(c,W,H);
 }
 
 /* Giao diện làm đẹp. Không sửa P, không thay preset hoặc cấu hình chỉnh dáng. */
 const beautyHead=$("#beautyHead"),beautyBox=$("#beautyBox"),beautyScan=$("#beautyScan"),beautyStatus=$("#beautyStatus");
 const beautyControls=[],beautyColors=[],beautyPalettes=[];
-const BEAUTY_SLIDERS=[["skin","Da trắng hồng","skin"],["hair","Độ phủ màu tóc","hair"],["lip","Son môi","face"],["blush","Má hồng","face"],["brow","Chân mày","face"]];
+const BEAUTY_SLIDERS=[["skin","Da trắng hồng","skin"],["smooth","Làm mịn mặt","smooth"],["hair","Độ phủ màu tóc","hair"],["lip","Son môi","face"],["blush","Má hồng","face"],["brow","Chân mày","face"]];
 function beautyMessage(message){beautyStatus.textContent=message;}
 function beautyUI(){
   const count=BEAUTY_SLIDERS.filter(([k])=>BEAUTY.values[k]>.001).length;
@@ -3632,7 +3706,7 @@ beautyHead.onclick=()=>{BEAUTY.open=!BEAUTY.open;beautyUI();};
 function beautyReset(){
   BEAUTY.job++;if(BEAUTY.busy)beautyWorkerStop();
   BEAUTY.values={...BEAUTY_DEFAULT};BEAUTY.maps=null;BEAUTY.faces=[];BEAUTY.faceCache=null;
-  BEAUTY.ready={skin:false,hair:false,face:false};BEAUTY.source=source;BEAUTY.busy=false;BEAUTY.peek=false;
+  BEAUTY.ready={skin:false,smooth:false,hair:false,face:false};BEAUTY.source=source;BEAUTY.busy=false;BEAUTY.peek=false;
   beautyMessage("Bấm nhận diện rồi chọn mức làm đẹp. Lần đầu cần mạng tải AI; ảnh được xử lý tại máy.");
   beautyUI();
 }
@@ -3655,6 +3729,7 @@ beautyScan.onclick=async()=>{
     BEAUTY.source=image;BEAUTY.faceCache=null;
     const m=BEAUTY.maps,has=map=>{let hits=0;for(const x of map)if(x>80)hits++;return hits>=Math.max(8,map.length*.00015);};
     BEAUTY.ready={skin:!!m&&has(m.skin),hair:!!m&&has(m.hair),face:BEAUTY.faces.length>0};
+    BEAUTY.ready.smooth=BEAUTY.ready.skin&&BEAUTY.ready.face;
     const labels=[];if(BEAUTY.ready.skin)labels.push("da");if(BEAUTY.ready.hair)labels.push("tóc");if(BEAUTY.ready.face)labels.push(BEAUTY.faces.length+" khuôn mặt");
     beautyMessage(labels.length?"Đã nhận diện "+labels.join(", ")+". Chọn màu hoặc kéo thanh để xem kết quả.":"Chưa nhận diện rõ da, tóc hoặc mặt. Thử ảnh sáng, khuôn mặt lớn hơn và ít bị che.");
     if(found.errors.length)beautyMessage(beautyStatus.textContent+" Một phần AI chưa tải được; có thể bấm nhận diện lại.");
